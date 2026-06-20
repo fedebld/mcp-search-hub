@@ -1,0 +1,12 @@
+# secrets / machine-local config (provided as *.example)
+**/src/.env
+mcp-web-search/searxng/settings.yml
+# editing backups (house convention)
+*.bak
+*.bak.*
+# python
+__pycache__/
+*.pyc
+*.pyo
+# runtime data volumes
+data/

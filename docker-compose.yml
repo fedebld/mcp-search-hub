@@ -1,0 +1,46 @@
+name: hermes-search-stack
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng_engine_secure
+    restart: unless-stopped
+    # [APPSEC] PORTA 8081 RIMOSSA. Isolato nella rete hermes_search_net.
+    # SearXNG e' accessibile solo da mcp_hub.
+    volumes:
+      # [MIG 496->219] path relativo al compose dir (era /opt/mcp-web-search, inesistente su 219)
+      - ./mcp-web-search/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng_data:/etc/searxng
+      - searxng_cache:/var/cache/searxng
+    networks:
+      - hermes_search_net
+
+  mcp_hub:
+    # [MIG 496->219] build locale: immagine assente dai registry
+    build:
+      context: ./mcp-web-search/mcp-hub
+    image: mcp-web-search-hub:latest
+    container_name: mcp_web_search_hub_secure
+    restart: unless-stopped
+    command: python hub.py
+    volumes:
+      # [CACHE-PERSIST] cache SQLite persistente fra restart del container
+      - mcp_cache_data:/app/data
+    ports:
+      # [APPSEC] Esposizione SICURA confinata a Tailscale
+      - "100.94.187.21:8765:8765"
+    networks:
+      - hermes_search_net
+    depends_on:
+      - searxng
+
+networks:
+  hermes_search_net:
+    driver: bridge
+
+volumes:
+  searxng_data:
+    name: hermes-search-stack_searxng_data
+  searxng_cache:
+    name: hermes-search-stack_searxng_cache
+  mcp_cache_data:
+    name: hermes-search-stack_mcp_cache_data

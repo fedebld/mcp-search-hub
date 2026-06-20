@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""MCP Info-Retrieval Hub — FastMCP orchestrator with dual-backend failover."""
+import logging
+import sys
+import httpx
+from mcp.server.fastmcp import FastMCP
+from backends import SearXNGBackend, DDSGBackend, TrafilaturaBackend
+from rate_limiter import RateLimiter, CircuitOpenError, RateLimitError, BackendHealthError
+from cache import TTLCache
+from config import settings
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("hub")
+
+ddgs_backend = DDSGBackend()
+searxng_backend = SearXNGBackend()
+trafilatura_backend = TrafilaturaBackend()
+
+ddgs_limiter = RateLimiter(
+    name="DDGS", rate_per_minute=settings.ddgs_rate_limit,
+    burst=settings.ddgs_burst, cool_down_seconds=settings.ddgs_cool_down, failure_threshold=3,
+)
+searxng_limiter = RateLimiter(
+    name="SearXNG", rate_per_minute=settings.searxng_rate_limit,
+    burst=settings.searxng_burst, cool_down_seconds=settings.searxng_cool_down, failure_threshold=5,
+)
+
+# [CACHE] Cache TTL+LRU condivisa dei risultati: abbatte chiamate ai backend e
+# pressione sul rate limiter per query ripetute (vedi cache.py).
+# [CACHE-PERSIST] db_path -> SQLite su volume: la cache sopravvive ai restart del container.
+search_cache = TTLCache(
+    max_size=settings.cache_max_size,
+    default_ttl=settings.cache_ttl_web,
+    db_path=settings.cache_db_path if settings.cache_persistent else None,
+)
+
+mcp = FastMCP("MCP Info-Retrieval Hub", host=settings.host, port=settings.port)
+
+
+async def _try_search(backend_name, limiter, search_fn, query, max_results, timelimit, region):
+    await limiter.acquire()
+    try:
+        results = await search_fn(query, max_results, timelimit, region)
+        if not results:
+            logger.warning("[%s] 0 results for '%s'", backend_name, query[:30])
+        await limiter.record_success()
+        return results
+    except (httpx.HTTPStatusError, ConnectionError, TimeoutError) as exc:
+        await limiter.record_failure()
+        status = getattr(exc, "response", None)
+        status_code = status.status_code if status else None
+        raise BackendHealthError(f"{backend_name} HTTP {status_code}: {exc}") from exc
+    except RuntimeError as exc:
+        await limiter.record_failure()
+        raise BackendHealthError(f"{backend_name} error: {exc}") from exc
+
+
+def _is_cacheable(result) -> bool:
+    # [CACHE] Memorizza solo risultati validi: liste non vuote o dict di contenuto.
+    # Mai cache di errori ({"error": ...}) o vuoti -> cosi' un retry puo' riprovare.
+    if isinstance(result, list):
+        return len(result) > 0
+    if isinstance(result, dict):
+        return "error" not in result
+    return False
+
+
+@mcp.tool()
+async def unified_web_search(query: str, max_results: int = 10, timelimit: str = None, region: str = "us-en") -> list[dict]:
+    """Unified web search with DDGS -> SearXNG failover. Args: query (str), max_results (int 1-20, default 10), timelimit (str: d|w|m|y), region (str: us-en default). Returns list of title+url+snippet."""
+    # [CACHE] lookup
+    cache_key = TTLCache.make_key("unified_web_search",
+                                  {"query": query, "max_results": max_results,
+                                   "timelimit": timelimit, "region": region})
+    if settings.cache_enabled:
+        cached = await search_cache.get(cache_key)
+        if cached is not None:
+            logger.info("[cache] HIT unified_web_search '%s'", query[:30])
+            return cached
+    chain = [
+        ("DDGS", ddgs_limiter, lambda q, m, t, r: ddgs_backend.search_text(q, m, t, r)),
+        ("SearXNG", searxng_limiter, lambda q, m, t, r: searxng_backend.search_text(q, m, t, r)),
+    ]
+    errors = []
+    for name, limiter, search_fn in chain:
+        try:
+            results = await _try_search(name, limiter, search_fn, query, max_results, timelimit, region)
+            if results:
+                if settings.cache_enabled:
+                    await search_cache.set(cache_key, results, ttl=settings.cache_ttl_web)
+                return results
+            logger.info("[search] %s empty, trying next", name)
+        except (CircuitOpenError, RateLimitError, BackendHealthError) as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+    if errors:
+        return {"error": f"All backends failed: {'; '.join(errors)}", "query": query}
+    return []
+
+
+@mcp.tool()
+async def unified_content_extract(url: str, fmt: str = "text_markdown") -> dict:
+    """Extract web page content to clean markdown (reader-view).
+
+    Uses trafilatura as the primary extractor: it strips nav/ads/sidebars/footers and
+    returns just the main content (markdown), falling back to the legacy DDGS/SearXNG
+    extraction only if trafilatura yields nothing. Args: url (str), fmt (str:
+    text_markdown|text_plain). Returns {url, content, extractor}; content truncated to 50k."""
+    # [CACHE] lookup
+    cache_key = TTLCache.make_key("unified_content_extract", {"url": url, "fmt": fmt})
+    if settings.cache_enabled:
+        cached = await search_cache.get(cache_key)
+        if cached is not None:
+            logger.info("[cache] HIT unified_content_extract '%s'", url[:50])
+            return cached
+    # [FASE 1] Primary: trafilatura reader-view extraction. This is a direct fetch of the
+    # target page, so it does NOT consume the DDGS/SearXNG global rate-limiters (it offloads
+    # them). Falls through to the legacy DDGS -> SearXNG chain only if it yields nothing.
+    try:
+        result = await trafilatura_backend.extract_content(url, fmt)
+        if settings.cache_enabled and _is_cacheable(result):
+            await search_cache.set(cache_key, result, ttl=settings.cache_ttl_extract)
+        return result
+    except Exception as exc0:
+        logger.info("[extract] trafilatura primary failed, falling back: %s", exc0)
+    try:
+        await ddgs_limiter.acquire()
+        result = await ddgs_backend.extract_content(url, fmt)
+        await ddgs_limiter.record_success()
+        if settings.cache_enabled and _is_cacheable(result):
+            await search_cache.set(cache_key, result, ttl=settings.cache_ttl_extract)
+        return result
+    except Exception as exc:
+        logger.warning("[extract] DDGS failed: %s", exc)
+        await ddgs_limiter.record_failure()
+    try:
+        await searxng_limiter.acquire()
+        result = await searxng_backend.extract_content(url, fmt)
+        await searxng_limiter.record_success()
+        if settings.cache_enabled and _is_cacheable(result):
+            await search_cache.set(cache_key, result, ttl=settings.cache_ttl_extract)
+        return result
+    except Exception as exc2:
+        logger.error("[extract] All backends failed: %s", exc2)
+        await searxng_limiter.record_failure()
+        return {"url": url, "error": f"Extraction failed: {exc2}"}
+
+
+@mcp.tool()
+async def unified_image_search(query: str, max_results: int = 10, region: str = "us-en") -> list[dict]:
+    """Search for images. Args: query (str), max_results (int 1-20, default 10), region (str). Returns list of title+url+source."""
+    # [CACHE] lookup
+    cache_key = TTLCache.make_key("unified_image_search",
+                                  {"query": query, "max_results": max_results, "region": region})
+    if settings.cache_enabled:
+        cached = await search_cache.get(cache_key)
+        if cached is not None:
+            logger.info("[cache] HIT unified_image_search '%s'", query[:30])
+            return cached
+    try:
+        await ddgs_limiter.acquire()
+        results = await ddgs_backend.search_images(query, max_results, region)
+        await ddgs_limiter.record_success()
+        if settings.cache_enabled and _is_cacheable(results):
+            await search_cache.set(cache_key, results, ttl=settings.cache_ttl_image)
+        return results
+    except Exception as exc:
+        await ddgs_limiter.record_failure()
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+async def unified_news_search(query: str, max_results: int = 10, timelimit: str = None, region: str = "us-en") -> list[dict]:
+    """Search for news articles. Args: query (str), max_results (int 1-20, default 10), timelimit (str: d|w|m|y), region (str). Returns list of title+url+source+date."""
+    # [CACHE] lookup
+    cache_key = TTLCache.make_key("unified_news_search",
+                                  {"query": query, "max_results": max_results,
+                                   "timelimit": timelimit, "region": region})
+    if settings.cache_enabled:
+        cached = await search_cache.get(cache_key)
+        if cached is not None:
+            logger.info("[cache] HIT unified_news_search '%s'", query[:30])
+            return cached
+    try:
+        await ddgs_limiter.acquire()
+        results = await ddgs_backend.search_news(query, max_results, region, timelimit)
+        await ddgs_limiter.record_success()
+        if settings.cache_enabled and _is_cacheable(results):
+            await search_cache.set(cache_key, results, ttl=settings.cache_ttl_news)
+        return results
+    except Exception as exc:
+        await ddgs_limiter.record_failure()
+        logger.warning("[news] DDGS failed: %s, fallback", exc)
+        try:
+            return await unified_web_search(f"news: {query}", max_results, timelimit, region)
+        except Exception:
+            return {"error": "News search unavailable"}
+
+
+@mcp.tool()
+async def cache_stats() -> dict:
+    """Cache observability (read-only). Returns hits, misses, size, max_size, hit_ratio, enabled, persistent."""
+    return {**search_cache.stats, "enabled": settings.cache_enabled, "persistent": search_cache.persistent}
+
+
+def main():
+    logger.info("Starting MCP Hub on %s:%d", settings.host, settings.port)
+    logger.info("DDGS: %d/min burst=%d cool=%ds", settings.ddgs_rate_limit, settings.ddgs_burst, settings.ddgs_cool_down)
+    logger.info("SearXNG: %d/min burst=%d cool=%ds", settings.searxng_rate_limit, settings.searxng_burst, settings.searxng_cool_down)
+    logger.info("SearXNG URL: %s", settings.searxng_url)
+    logger.info("Cache: enabled=%s persistent=%s db=%s max=%d ttl web/news/img/extract=%d/%d/%d/%d",
+                settings.cache_enabled, settings.cache_persistent, settings.cache_db_path, settings.cache_max_size,
+                settings.cache_ttl_web, settings.cache_ttl_news,
+                settings.cache_ttl_image, settings.cache_ttl_extract)
+    mcp.run(transport="sse")
+
+
+if __name__ == "__main__":
+    main()

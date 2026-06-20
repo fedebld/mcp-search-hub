@@ -1,0 +1,11 @@
+use_default_settings: true
+search:
+  formats:
+    - html
+    - json
+  safe_search: 0
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "CHANGE_ME_generate_with_openssl_rand_hex_32"
+  method: "POST"

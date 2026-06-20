@@ -69,6 +69,39 @@ def _is_cacheable(result) -> bool:
     return False
 
 
+def _tag_engine(results, engine: str):
+    """[B3] Stamp the answering backend on each result for observability/debugging."""
+    if isinstance(results, list):
+        for r in results:
+            if isinstance(r, dict):
+                r.setdefault("engine", engine)
+    return results
+
+
+def _classify_extract_error(exc: Exception | None) -> tuple[str, int | None]:
+    """[B4] Map an extraction exception to (kind, http_status). Lets the caller distinguish
+    404/403/timeout/disconnect/empty instead of one opaque message."""
+    if exc is None:
+        return ("unknown", None)
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code if exc.response is not None else None
+        return (f"http_{code}", code)
+    if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout)):
+        return ("timeout", None)
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return ("disconnect", None)
+    if isinstance(exc, httpx.ConnectError):
+        return ("connect_error", None)
+    if isinstance(exc, ValueError):  # trafilatura "no main content"
+        return ("empty_content", None)
+    return (type(exc).__name__, None)
+
+
+# [B1b] Below this many image hits we treat the answer as weak: do NOT cache it (so a retry
+# can hit the failover) and trigger the SearXNG fallback rather than freezing junk for the TTL.
+IMAGE_MIN_OK = int(getattr(settings, "image_min_ok", 0) or 0) or 3
+
+
 @mcp.tool()
 async def unified_web_search(query: str, max_results: int = 10, timelimit: str = None, region: str = "us-en") -> list[dict]:
     """Unified web search with DDGS -> SearXNG failover. Args: query (str), max_results (int 1-20, default 10), timelimit (str: d|w|m|y), region (str: us-en default). Returns list of title+url+snippet."""
@@ -90,6 +123,7 @@ async def unified_web_search(query: str, max_results: int = 10, timelimit: str =
         try:
             results = await _try_search(name, limiter, search_fn, query, max_results, timelimit, region)
             if results:
+                results = _tag_engine(results, name)  # [B3]
                 if settings.cache_enabled:
                     await search_cache.set(cache_key, results, ttl=settings.cache_ttl_web)
                 return results
@@ -120,12 +154,14 @@ async def unified_content_extract(url: str, fmt: str = "text_markdown") -> dict:
     # [FASE 1] Primary: trafilatura reader-view extraction. This is a direct fetch of the
     # target page, so it does NOT consume the DDGS/SearXNG global rate-limiters (it offloads
     # them). Falls through to the legacy DDGS -> SearXNG chain only if it yields nothing.
+    primary_err = None
     try:
         result = await trafilatura_backend.extract_content(url, fmt)
         if settings.cache_enabled and _is_cacheable(result):
             await search_cache.set(cache_key, result, ttl=settings.cache_ttl_extract)
         return result
     except Exception as exc0:
+        primary_err = exc0
         logger.info("[extract] trafilatura primary failed, falling back: %s", exc0)
     try:
         await ddgs_limiter.acquire()
@@ -147,7 +183,16 @@ async def unified_content_extract(url: str, fmt: str = "text_markdown") -> dict:
     except Exception as exc2:
         logger.error("[extract] All backends failed: %s", exc2)
         await searxng_limiter.record_failure()
-        return {"url": url, "error": f"Extraction failed: {exc2}"}
+        # [B4] Classify the failure: surface HTTP status / error kind from the PRIMARY fetch
+        # (trafilatura's direct GET carries the real status) instead of the last backend's
+        # generic "Server disconnected".
+        kind, status = _classify_extract_error(primary_err or exc2)
+        return {
+            "url": url,
+            "error": f"Extraction failed ({kind}): {primary_err or exc2}",
+            "error_kind": kind,
+            "http_status": status,
+        }
 
 
 @mcp.tool()
@@ -161,16 +206,42 @@ async def unified_image_search(query: str, max_results: int = 10, region: str = 
         if cached is not None:
             logger.info("[cache] HIT unified_image_search '%s'", query[:30])
             return cached
+    # [B1] DDGS images, then SearXNG images on failure OR on a weak (< IMAGE_MIN_OK) answer.
+    # DDGS images frequently degrades to a single off-topic hit; the failover recovers it.
+    errors = []
+    ddgs_results = []
     try:
         await ddgs_limiter.acquire()
-        results = await ddgs_backend.search_images(query, max_results, region)
+        ddgs_results = await ddgs_backend.search_images(query, max_results, region)
         await ddgs_limiter.record_success()
-        if settings.cache_enabled and _is_cacheable(results):
-            await search_cache.set(cache_key, results, ttl=settings.cache_ttl_image)
-        return results
     except Exception as exc:
         await ddgs_limiter.record_failure()
-        return {"error": str(exc)}
+        errors.append(f"DDGS: {exc}")
+
+    if isinstance(ddgs_results, list) and len(ddgs_results) >= IMAGE_MIN_OK:
+        results = _tag_engine(ddgs_results, "DDGS")
+        if settings.cache_enabled:
+            await search_cache.set(cache_key, results, ttl=settings.cache_ttl_image)
+        return results
+
+    # Weak or failed → try SearXNG images.
+    try:
+        await searxng_limiter.acquire()
+        sx_results = await searxng_backend.search_images(query, max_results, region)
+        await searxng_limiter.record_success()
+        if sx_results:
+            results = _tag_engine(sx_results, "SearXNG")
+            if settings.cache_enabled and len(results) >= IMAGE_MIN_OK:
+                await search_cache.set(cache_key, results, ttl=settings.cache_ttl_image)
+            return results
+    except Exception as exc2:
+        await searxng_limiter.record_failure()
+        errors.append(f"SearXNG: {exc2}")
+
+    # Nothing strong: return DDGS's weak hits if any (uncached so a retry can recover), else error.
+    if ddgs_results:
+        return _tag_engine(ddgs_results, "DDGS")
+    return {"error": f"Image search failed: {'; '.join(errors) or 'no results'}", "query": query}
 
 
 @mcp.tool()
@@ -189,6 +260,7 @@ async def unified_news_search(query: str, max_results: int = 10, timelimit: str 
         await ddgs_limiter.acquire()
         results = await ddgs_backend.search_news(query, max_results, region, timelimit)
         await ddgs_limiter.record_success()
+        results = _tag_engine(results, "DDGS")  # [B3]
         if settings.cache_enabled and _is_cacheable(results):
             await search_cache.set(cache_key, results, ttl=settings.cache_ttl_news)
         return results
@@ -196,7 +268,23 @@ async def unified_news_search(query: str, max_results: int = 10, timelimit: str 
         await ddgs_limiter.record_failure()
         logger.warning("[news] DDGS failed: %s, fallback", exc)
         try:
-            return await unified_web_search(f"news: {query}", max_results, timelimit, region)
+            # [B2] Fallback to web search but NORMALIZE to the news schema and mark it
+            # degraded, so the caller never silently gets a different result shape.
+            web = await unified_web_search(f"news {query}", max_results, timelimit, region)
+            if isinstance(web, dict):  # error envelope
+                return {"error": "News search unavailable", "detail": web.get("error")}
+            normalized = []
+            for r in web:
+                normalized.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href") or r.get("url", ""),
+                    "body": r.get("body", ""),
+                    "source": r.get("engine", "web"),
+                    "date": "",                 # web search has no reliable date
+                    "engine": r.get("engine", "web"),
+                    "degraded": True,           # signals the news→web fallback path
+                })
+            return normalized
         except Exception:
             return {"error": "News search unavailable"}
 

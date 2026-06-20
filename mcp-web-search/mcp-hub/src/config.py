@@ -10,7 +10,7 @@ class Settings(BaseSettings):
 
     # DDGS
     ddgs_timeout: int = 10
-    ddgs_proxy: str | None = None
+    ddgs_proxy: str | None = None  # [anti-ban] e.g. "socks5://host:1080" to rotate egress
 
     # Rate limiting
     ddgs_rate_limit: int = 6
@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     searxng_rate_limit: int = 12
     searxng_burst: int = 6
     searxng_cool_down: int = 120
+
+    # [B1b] Minimum image hits before an image answer is considered strong enough to cache;
+    # below this the SearXNG failover is tried and weak results are returned uncached.
+    image_min_ok: int = 3
 
     # Server
     host: str = "0.0.0.0"

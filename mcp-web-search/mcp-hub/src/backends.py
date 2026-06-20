@@ -1,6 +1,7 @@
 """Backend wrappers for SearXNG, DDGS and trafilatura."""
 import asyncio
 import logging
+import random
 import httpx
 import trafilatura
 from ddgs import DDGS
@@ -10,9 +11,25 @@ from config import settings
 
 logger = logging.getLogger("backends")
 
-# Browser-like UA shared by the direct page-fetch extractors (trafilatura + SearXNG path).
-_EXTRACT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# [anti-ban] Rotate a small pool of realistic browser UAs on direct page fetches so repeated
+# extractions from the same egress IP don't fingerprint as a bot. One is picked per request.
+_UA_POOL = [
+    ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+     "(KHTML, like Gecko) Version/17.2 Safari/605.1.15"),
+    ("Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0"),
+]
+
+
+def _pick_ua() -> str:
+    return random.choice(_UA_POOL)
+
+
+# Default UA kept for backward compatibility (callers that import it).
+_EXTRACT_UA = _UA_POOL[0]
 _EXTRACT_MAX_CHARS = 50000
 
 
@@ -27,7 +44,7 @@ class TrafilaturaBackend:
 
     async def extract_content(self, url: str, fmt: str = "text_markdown") -> dict:
         async with httpx.AsyncClient(
-            timeout=15, follow_redirects=True, headers={"User-Agent": _EXTRACT_UA},
+            timeout=15, follow_redirects=True, headers={"User-Agent": _pick_ua()},
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
@@ -91,11 +108,33 @@ class SearXNGBackend:
         logger.info("[SearXNG] %d results for '%s'", len(results), query[:40])
         return results
 
+    async def search_images(
+        self, query: str, max_results: int = 10, region: str = "us-en"
+    ) -> list[dict]:
+        """[B1] Image search via SearXNG (categories=images) — the failover path for
+        unified_image_search when DDGS images degrade or return nothing."""
+        params = {"q": query, "format": "json", "categories": "images", "pageno": 1}
+        async with httpx.AsyncClient(
+            timeout=self.timeout, headers={"Host": self.host_header},
+        ) as client:
+            resp = await client.get(self.base_url + "/search", params=params)
+            resp.raise_for_status()
+
+        data = resp.json()
+        results = []
+        for r in data.get("results", [])[:max_results]:
+            results.append({
+                "title": r.get("title", ""),
+                "image": r.get("img_src", "") or r.get("url", ""),
+                "thumbnail": r.get("thumbnail_src", "") or r.get("thumbnail", ""),
+                "url": r.get("url", ""),
+                "source": r.get("source", "") or r.get("engine", ""),
+            })
+        logger.info("[SearXNG] %d image results for '%s'", len(results), query[:40])
+        return results
+
     async def extract_content(self, url: str, fmt: str = "text_markdown") -> dict:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        }
+        headers = {"User-Agent": _pick_ua()}
         async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
             resp = await client.get(url)
             resp.raise_for_status()

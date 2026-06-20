@@ -1,0 +1,25 @@
+# Place at: .github/workflows/smoke.yml  in fedebld/mcp-search-hub
+name: smoke
+on: [push, pull_request]
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    env:
+      SRC: mcp-web-search/mcp-hub/src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r mcp-web-search/mcp-hub/requirements.txt || pip install httpx trafilatura ddgs markdownify "mcp[cli]" pydantic-settings
+          pip install pytest
+      - name: Copy regression tests
+        run: cp ci/test_searchhub_fixes.py "$SRC/" 2>/dev/null || true
+      - name: Syntax check
+        run: python -m compileall -q "$SRC"
+      - name: Unit / regression tests
+        working-directory: ${{ env.SRC }}
+        env: { PYTHONPATH: "." }
+        run: pytest -q test_searchhub_fixes.py

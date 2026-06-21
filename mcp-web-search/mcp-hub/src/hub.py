@@ -38,7 +38,36 @@ search_cache = TTLCache(
     db_path=settings.cache_db_path if settings.cache_persistent else None,
 )
 
-mcp = FastMCP("MCP Info-Retrieval Hub", host=settings.host, port=settings.port)
+import os as _os
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+
+
+def _load_doc(name: str, default: str = "") -> str:
+    try:
+        with open(_os.path.join(_HERE, name), encoding="utf-8") as _f:
+            return _f.read()
+    except OSError:
+        return default
+
+
+_INSTRUCTIONS = (
+    "Self-hosted web search hub: web/news/image search + reader-view content "
+    "extraction, with DDGS -> SearXNG failover and trafilatura. Reach for "
+    "`unified_web_search(query)` first; `unified_news_search` for dated news, "
+    "`unified_image_search` for images, `unified_content_extract(url)` to turn a "
+    "page into clean markdown, `cache_stats` for read-only cache metrics. Results "
+    "are cached. NOTE: on total backend failure `unified_web_search` and "
+    "`unified_image_search` return a dict {\"error\": ...} instead of a list — "
+    "handle both shapes. Full agent guide: read resource skill://web-search-hub."
+)
+
+mcp = FastMCP(
+    "MCP Info-Retrieval Hub",
+    instructions=_INSTRUCTIONS,
+    host=settings.host,
+    port=settings.port,
+)
 
 
 async def _try_search(backend_name, limiter, search_fn, query, max_results, timelimit, region):
@@ -293,6 +322,29 @@ async def unified_news_search(query: str, max_results: int = 10, timelimit: str 
 async def cache_stats() -> dict:
     """Cache observability (read-only). Returns hits, misses, size, max_size, hit_ratio, enabled, persistent."""
     return {**search_cache.stats, "enabled": settings.cache_enabled, "persistent": search_cache.persistent}
+
+
+
+@mcp.resource(
+    "skill://web-search-hub",
+    name="SKILL.md",
+    description="Agent-facing usage guide for this server.",
+    mime_type="text/markdown",
+)
+def skill_doc() -> str:
+    """Agent-facing skill card (how to use this server well)."""
+    return _load_doc("SKILL.md", _INSTRUCTIONS)
+
+
+@mcp.resource(
+    "readme://web-search-hub",
+    name="README.md",
+    description="Human-facing README for this server.",
+    mime_type="text/markdown",
+)
+def readme_doc() -> str:
+    """Human-facing README."""
+    return _load_doc("README.md", "")
 
 
 def main():
